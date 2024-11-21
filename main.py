@@ -3,8 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from scipy.optimize import linprog
 from typing import List, Optional
+import numpy as np
 
-app = FastAPI()
+app = FastAPI(
+    title="Otimização Linear - Método Simplex",
+    description="API para resolver problemas de programação linear usando o método Simplex",
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +25,19 @@ class SimplexInput(BaseModel):
     rhs_ineq: List[float]
     desired_variations: List[float]
 
+    class Config:
+        schema_extra = {
+            "example": {
+                "objective": [3, 2],
+                "lhs_ineq": [
+                    [2, 1],
+                    [1, 3],
+                ],
+                "rhs_ineq": [100, 90],
+                "desired_variations": [10, 5],
+            }
+        }
+
 
 class SimplexResult(BaseModel):
     status: int
@@ -32,85 +49,76 @@ class SimplexResult(BaseModel):
     new_optimal_values: Optional[List[Optional[float]]] = None
 
 
-@app.post("/solve", response_model=SimplexResult)
-async def solve_simplex(input_data: SimplexInput):
-    result = linprog(
-        c=input_data.objective,
-        A_ub=input_data.lhs_ineq,
-        b_ub=input_data.rhs_ineq,
-        method="simplex",
-    )
-
-    if not result.success:
-        raise HTTPException(
-            status_code=400, detail="Optimization failed: " + result.message
-        )
-
+def calculate_shadow_prices(objective, lhs_ineq, rhs_ineq, original_result):
     shadow_prices = []
-    for i, constraint_rhs in enumerate(input_data.rhs_ineq):
-        perturbed_rhs = input_data.rhs_ineq[:]
-        perturbed_rhs[i] += 1e-5
+    delta = 1e-6
+
+    for i in range(len(rhs_ineq)):
+        perturbed_rhs = rhs_ineq.copy()
+        perturbed_rhs[i] += delta
+
         perturbed_result = linprog(
-            c=input_data.objective,
-            A_ub=input_data.lhs_ineq,
+            c=[-x for x in objective],
+            A_ub=lhs_ineq,
             b_ub=perturbed_rhs,
             method="simplex",
         )
+
         if perturbed_result.success:
-            shadow_price = (perturbed_result.fun - result.fun) / 1e-5
+            shadow_price = (-perturbed_result.fun - (-original_result.fun)) / delta
             shadow_prices.append(shadow_price)
         else:
             shadow_prices.append(0.0)
 
-    variation_viable = []
-    adjusted_rhs = [
-        rhs + variation
-        for rhs, variation in zip(input_data.rhs_ineq, input_data.desired_variations)
-    ]
-    print("Adjusted RHS with combined variations:", adjusted_rhs)
+    return shadow_prices
 
-    adjusted_result = linprog(
-        c=input_data.objective,
-        A_ub=input_data.lhs_ineq,
-        b_ub=adjusted_rhs,
-        method="simplex",
-    )
 
-    if adjusted_result.success:
-        variation_viable = [True] * len(input_data.desired_variations)
-        new_optimal_value = adjusted_result.fun
-    else:
-        variation_viable = [False] * len(input_data.desired_variations)
-        new_optimal_value = None
+@app.post("/solve", response_model=SimplexResult)
+async def solve_simplex(input_data: SimplexInput):
+    try:
+        objective_coeffs = [-x for x in input_data.objective]
 
-    combined_optimal_value = None
-    if all(variation_viable):
-        combined_rhs = [
-            rhs + variation
-            for rhs, variation in zip(
-                input_data.rhs_ineq, input_data.desired_variations
-            )
-        ]
-        print("combined_rhs:", combined_rhs)
-        combined_result = linprog(
-            c=input_data.objective,
+        result = linprog(
+            c=objective_coeffs,
             A_ub=input_data.lhs_ineq,
-            b_ub=combined_rhs,
+            b_ub=input_data.rhs_ineq,
             method="simplex",
         )
-        if combined_result.success:
-            combined_optimal_value = combined_result.fun
 
-    new_optimal_values = (
-        [combined_optimal_value] if combined_optimal_value is not None else []
-    )
+        if not result.success:
+            raise HTTPException(
+                status_code=400, detail=f"Otimização falhou: {result.message}"
+            )
 
-    return SimplexResult(
-        status=1,
-        message="Optimization successful",
-        optimal_value=result.fun,
-        solution=result.x.tolist(),
-        shadow_prices=shadow_prices,
-        variation_viable=variation_viable,
-        new_optimal_values=new_optimal_values,
-    )
+        shadow_prices = calculate_shadow_prices(
+            input_data.objective, input_data.lhs_ineq, input_data.rhs_ineq, result
+        )
+
+        adjusted_rhs = [
+            r + v for r, v in zip(input_data.rhs_ineq, input_data.desired_variations)
+        ]
+
+        varied_result = linprog(
+            c=objective_coeffs,
+            A_ub=input_data.lhs_ineq,
+            b_ub=adjusted_rhs,
+            method="simplex",
+        )
+
+        variation_viable = varied_result.success
+        new_optimal_value = -varied_result.fun if varied_result.success else None
+
+        return SimplexResult(
+            status=1,
+            message="Otimização concluída com sucesso",
+            optimal_value=-result.fun,
+            solution=result.x.tolist(),
+            shadow_prices=shadow_prices,
+            variation_viable=[variation_viable] * len(input_data.rhs_ineq),
+            new_optimal_values=(
+                [new_optimal_value] if new_optimal_value is not None else None
+            ),
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
